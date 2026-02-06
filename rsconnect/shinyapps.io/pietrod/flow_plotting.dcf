@@ -1,0 +1,12 @@
+name: flow_plotting
+title: flow_plotting
+username: pietrod
+account: pietrod
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16577847
+bundleId: 11546446
+url: https://pietrod.shinyapps.io/flow_plotting/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
