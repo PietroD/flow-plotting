@@ -458,7 +458,7 @@ server <- function(input, output, session) {
       select(Group, valor = all_of(var_name)) %>%
       mutate(Group = droplevels(Group)) %>%
       tidyplot(x = Group, y = valor, color = Group) %>%
-      add_reference_lines(y = 0, linetype = "solid", linewidth = 0.3) %>%
+      # add_reference_lines(y = 0, linetype = "solid", linewidth = 0.3) %>%
       add(stat_summary(fun = mean, geom = "bar", color = "black", width = 0.8, linewidth = 0.3) ) %>%
       add_sem_errorbar(color = "black", linewidth = 0.3) %>%
       add(geom_jitter(position = position_jitter(width = 0.15, height = 0),
@@ -471,15 +471,20 @@ server <- function(input, output, session) {
       #   step.increase = 0.15,
       #   label = "{p.adj.signif}"
       # ) %>% 
-      add(scale_y_continuous(guide = "prism_offset_minor",
-                             expand = expansion(mult = c(0, 0.075)))) %>%
+      # add(scale_y_continuous(
+      #   guide = "prism_offset_minor", 
+      #   expand = expansion(mult = c(0, G_AES$y_expansion))
+      # )) %>%
+      add(coord_cartesian(ylim = c(0, NA), clip = "off")) %>%
       adjust_y_axis_title(var_name) %>%
       adjust_x_axis_title("") %>%
       add_title(word(var_name, 1)) %>%
       add(theme = theme(
+        plot.title = element_text(face = "bold", size = 12, hjust = 0.5, margin = margin(b = 10)),
         axis.line = element_line(colour = "black", linewidth = 0.3),
         axis.ticks.y = element_line(linewidth = 0.3),
         axis.text.y = element_text(color = "black", size = 10),
+        axis.title.y = element_text(color = "black", size = 10),
         axis.text.x = element_blank(),
         plot.margin = margin(t = 10, r = 10, b = 10, l = 40, unit = "pt"),
         legend.position = if (isTRUE(input$show_legend)) "right" else "none"
@@ -529,6 +534,30 @@ server <- function(input, output, session) {
         label = "{p.signif}"
       )
     }
+    
+    p <- p %>%
+      # this is the real baseline at y=0
+      add_reference_lines(y = 0, linetype = "solid", linewidth = 0.3) %>%
+      
+      # FORCE the bottom of the scale to be exactly 0 (not via coord_cartesian)
+      add(scale_y_continuous(
+        limits = c(0, NA),
+        expand = expansion(mult = c(0, 0.075))
+      )) %>%
+      
+      # IMPORTANT: remove coord_cartesian(ylim=c(0,NA)) (no longer needed)
+      # add(coord_cartesian(...))   # <-- DELETE THIS LINE
+      
+      add(theme = theme(
+        # keep y axis line if you want
+        axis.line.y = element_line(colour = "black", linewidth = 0.3),
+        
+        # DON'T use the panel border as the “baseline”
+        axis.line.x = element_blank(),
+        
+        # optional: also remove x ticks if you want (you already hide x text)
+        axis.ticks.x = element_blank()
+      ))
     
     return(p)
     
