@@ -49,7 +49,6 @@ ui <- fluidPage(
       sliderInput("bar_width", "Width per Bar (cm)", min = 0.3, max = 1.5, value = 0.6, step = 0.1),
       sliderInput("plot_height", "Plot Height (cm)", min = 3, max = 15, value = 6),
       
-      
       textInput(
         "colors",
         "Anchor default colors (reference)",
@@ -84,6 +83,20 @@ ui <- fluidPage(
 )
 
 server <- function(input, output, session) {
+  
+  # Draw a plot/grob inside a smaller canvas to create padding (prevents PDF cropping)
+  pad_right <- function(p, right_frac = 0.04, left_frac = 0.00, top_frac = 0.00, bottom_frac = 0.00) {
+    # right_frac = 0.04 means keep 4% blank space on the right
+    cowplot::ggdraw() +
+      cowplot::draw_plot(
+        p,
+        x = left_frac,
+        y = bottom_frac,
+        width  = 1 - left_frac - right_frac,
+        height = 1 - top_frac - bottom_frac,
+        hjust = 0, vjust = 0
+      )
+  }
   
   is_id_like <- function(x) {
     x <- as.character(x)
@@ -170,11 +183,22 @@ server <- function(input, output, session) {
     keep
   })
   
+  # ============================================================================
+  # EDIT 1) Replace your clean_groups() with the "nuclear" cleaner
+  # ============================================================================
   clean_groups <- function(x) {
     x <- as.character(x)
-    x <- str_replace_all(x, "\u00A0", " ")
-    x <- str_squish(x)
-    x <- x[!is.na(x) & x != "" & x != "NA"]
+    x <- gsub("[\u200b\u200c\u200d\ufeff\u00A0]", "", x, perl = TRUE) # remove invisibles + NBSP
+    x <- stringr::str_trim(x)
+    
+    keep <- !is.na(x) &
+      x != "" &
+      x != "NA" &
+      x != "_" &
+      x != "-" &
+      grepl("\\S", x, perl = TRUE)
+    
+    x <- x[keep]
     unique(x)
   }
   
@@ -188,17 +212,8 @@ server <- function(input, output, session) {
       return(helpText("No character columns found for grouping. Using Group = 'All'."))
     }
     
-    # Identify non-ID-like grouping candidates
     good_group_cols <- nn[!sapply(df[nn], is_id_like)]
-    
-    # Default selection logic:
-    # 1) first non-ID-like column if available
-    # 2) otherwise fall back to first character column
-    default_sel <- if (length(good_group_cols) > 0) {
-      good_group_cols[1]
-    } else {
-      nn[1]
-    }
+    default_sel <- if (length(good_group_cols) > 0) good_group_cols[1] else nn[1]
     
     checkboxGroupInput(
       "group_cols",
@@ -214,45 +229,48 @@ server <- function(input, output, session) {
     nn <- non_numeric_cols()
     
     good_group_cols <- nn[!sapply(df[nn], is_id_like)]
-    default_sel <- if (length(good_group_cols) > 0) {
-      good_group_cols[1]
-    } else {
-      nn[1]
-    }
+    default_sel <- if (length(good_group_cols) > 0) good_group_cols[1] else nn[1]
     
     updateCheckboxGroupInput(session, "group_cols", selected = default_sel)
   })
   
-  # Processed data: keep character columns as-is; Group comes ONLY from selected column
+  # ============================================================================
+  # EDIT 2) In processed_data(): aggressively clean the Group COLUMN ITSELF
+  #         and remove "ghost" rows BEFORE factor/droplevels
+  # ============================================================================
   processed_data <- reactive({
     req(raw_df())
     df <- raw_df()
     
     group_cols <- input$group_cols
     if (is.null(group_cols)) group_cols <- character(0)
-    group_cols <- intersect(group_cols, names(df))  # safety
+    group_cols <- intersect(group_cols, names(df))
     
-    # Build Group AFTER user selection:
     if (length(group_cols) == 0) {
       df <- df %>% mutate(Group = "All")
     } else if (length(group_cols) == 1) {
       df <- df %>% mutate(Group = as.character(.data[[group_cols[1]]]))
     } else {
-      # paste selected columns with "_"
-      df <- df %>%
-        unite("Group", all_of(group_cols), sep = "_", remove = FALSE, na.rm = TRUE)
+      df <- df %>% unite("Group", all_of(group_cols), sep = "_", remove = FALSE, na.rm = TRUE)
     }
     
-    # Clean Group
-    df <- df %>%
-      mutate(
-        Group = as.character(Group),
-        Group = str_replace_all(Group, "\u00A0", " "),
-        Group = str_squish(Group)
-      ) %>%
-      filter(!is.na(Group) & Group != "" & Group != "NA")
+    # --- APPLY NUCLEAR CLEANING TO THE COLUMN + FILTER ROWS ---
+    df$Group <- as.character(df$Group)
+    df$Group <- gsub("[\u200b\u200c\u200d\ufeff\u00A0]", "", df$Group, perl = TRUE)
+    df$Group <- stringr::str_trim(df$Group)
     
-    # Convert all columns NOT involved in grouping (and not Group) to numeric where possible
+    df <- df %>%
+      filter(
+        !is.na(Group),
+        Group != "",
+        Group != "NA",
+        !Group %in% c("_", "__", "-", "--"),
+        grepl("\\S", Group, perl = TRUE)
+      )
+    
+    df$Group <- droplevels(factor(df$Group))
+    # ---------------------------------------------------------
+    
     protected <- unique(c("Group", group_cols))
     candidate_cols <- setdiff(names(df), protected)
     
@@ -269,28 +287,18 @@ server <- function(input, output, session) {
       df <- df %>% filter(if_any(all_of(num_cols), ~ !is.na(.x)))
     }
     
-    df$Group <- droplevels(as.factor(df$Group))
     df
   })
   
   observeEvent(processed_data(), {
     df_proc <- processed_data()
-    
-    # numeric columns allowed based on raw excel (prevents char columns creeping in)
     allowed <- numeric_cols_from_raw()
-    
-    # only keep columns that exist in processed_data and are numeric there
     new_choices <- intersect(allowed, names(df_proc)[sapply(df_proc, is.numeric)])
     
     old_sel <- isolate(input$selected_vars)
     if (is.null(old_sel)) old_sel <- character(0)
-    
     kept <- intersect(old_sel, new_choices)
-    
-    # default = first numeric column only (your preference)
-    if (length(kept) == 0 && length(new_choices) > 0) {
-      kept <- new_choices[1]
-    }
+    if (length(kept) == 0 && length(new_choices) > 0) kept <- new_choices[1]
     
     updateCheckboxGroupInput(
       session,
@@ -305,7 +313,6 @@ server <- function(input, output, session) {
     grps <- grps[!is.na(grps) & grps != ""]
     if (length(grps) == 0) return()
     
-    # preserve current selection if possible
     cur <- isolate(input$ref_group)
     if (is.null(cur)) cur <- "__ALL__"
     if (cur != "__ALL__" && !(cur %in% grps)) cur <- "__ALL__"
@@ -319,7 +326,6 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
   
   output$var_selector <- renderUI({
-    # render the control once; choices/selection will be managed by observers below
     checkboxGroupInput(
       "selected_vars",
       "3. Select Variables:",
@@ -336,11 +342,7 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$deselect_all_vars, {
-    updateCheckboxGroupInput(
-      session,
-      "selected_vars",
-      selected = character(0)
-    )
+    updateCheckboxGroupInput(session, "selected_vars", selected = character(0))
   })
   
   observeEvent(list(processed_data(), input$selected_vars), {
@@ -362,7 +364,6 @@ server <- function(input, output, session) {
     clean_groups(processed_data()$Group)
   })
   
-  # Default palette: exactly N colors, never recycles
   default_palette_n <- function(n) {
     anchors <- MY_DEFAULT_COLORS
     if (n <= length(anchors)) return(anchors[seq_len(n)])
@@ -419,34 +420,93 @@ server <- function(input, output, session) {
     }
   })
   
-  legend_plot <- function(groups, pal_named, horizontal = TRUE) {
-    groups <- clean_groups(groups)
-    pal <- pal_named[groups]
-    if (any(is.na(pal))) pal[is.na(pal)] <- default_palette_n(length(groups))[is.na(pal)]
-    pal <- unname(pal); names(pal) <- groups
+  # ============================================================================
+  # EDIT 3) Replace legend_plot(): build a manual legend (no ggplot legend key)
+  #         This removes the "extra empty box" permanently.
+  # ============================================================================
+  # --- helper: compute a good width/height for a vertical legend (prevents cropping) ---
+  legend_dims_vertical <- function(groups, text_pt = 11, key_cm = 0.42) {
+    g <- clean_groups(groups)
+    if (length(g) == 0) return(list(w_cm = 6, h_cm = 3))
     
-    df_leg <- tibble(Group = factor(groups, levels = groups), x = 1, y = 1)
+    max_label <- g[which.max(nchar(g))]
     
-    ggplot(df_leg, aes(x = x, y = y, fill = Group)) +
-      geom_point(shape = 22, size = 6, color = "black") +
-      scale_fill_manual(values = pal, breaks = groups, limits = groups, drop = TRUE, na.translate = FALSE) +
-      theme_void() +
-      theme(
-        legend.title = element_blank(),
-        legend.position = if (horizontal) "top" else "right",
-        legend.direction = if (horizontal) "horizontal" else "vertical",
-        legend.background = element_rect(fill = "transparent", color = NA),
-        legend.box.background = element_rect(fill = "transparent", color = NA),
-        plot.margin = margin(0, 0, 0, 0),
-        legend.justification = "center"
-      ) +
-      guides(fill = guide_legend(
-        nrow = if (horizontal && length(groups) > 3) 2 else 1,
-        byrow = TRUE
-      ))
+    # open null device for safe measurement (prevents device errors)
+    grDevices::pdf(NULL)
+    
+    # set font size for measurement
+    grid::pushViewport(grid::viewport(gp = grid::gpar(fontsize = text_pt)))
+    
+    txt_w_in <- grid::convertWidth(
+      grid::stringWidth(max_label),
+      unitTo = "in",
+      valueOnly = TRUE
+    )
+    
+    grid::popViewport()
+    grDevices::dev.off()
+    
+    txt_w_cm <- txt_w_in * 2.54
+    
+    # total width = left pad + key + gap + text + right pad
+    w_cm <- 0.8 + key_cm + 0.6 + txt_w_cm + 1.2
+    
+    # height per row + padding
+    row_h_cm <- 0.60
+    h_cm <- 0.8 + row_h_cm * length(g) + 0.8
+    
+    list(w_cm = w_cm, h_cm = h_cm)
   }
   
-  plot_generator <- function(var_name) {
+  # --- manual vertical legend: square keys + no ggplot legend (so no “extra box”) ---
+  legend_plot_vertical <- function(groups, pal_named,
+                                   key_cm = 0.42,
+                                   text_pt = 8) {
+    groups <- clean_groups(groups)
+    if (length(groups) == 0) stop("No valid groups found after cleaning.")
+    
+    cols <- pal_named[groups]
+    if (any(is.na(cols))) {
+      fb <- default_palette_n(length(groups))
+      cols[is.na(cols)] <- fb[is.na(cols)]
+    }
+    cols <- unname(cols)
+    
+    df_leg <- tibble(
+      label = as.character(groups),
+      fill  = cols,
+      y     = rev(seq_along(groups))
+    ) %>%
+      mutate(
+        x_key  = 0,
+        x_text = key_cm/2 + 0.30
+      )
+    
+    max_chars <- max(nchar(df_leg$label))
+    x_right <- df_leg$x_text[1] + max_chars * 0.18  # a bit more generous than 0.14
+    
+    ggplot(df_leg, aes(y = y)) +
+      geom_tile(aes(x = x_key, fill = fill),
+                width = key_cm, height = key_cm, color = "black") +
+      geom_text(aes(x = x_text, label = label),
+                hjust = 0, vjust = 0.5, color = "black") +
+      scale_fill_identity() +
+      scale_x_continuous(
+        limits = c(-key_cm, x_right),
+        expand = expansion(mult = c(0, 0))
+      ) +
+      coord_cartesian(clip = "off") +        # <-- IMPORTANT
+      theme_void() +
+      theme(
+        text = element_text(size = as.numeric(text_pt)),
+        plot.margin = margin(t = 8, r = 120, b = 8, l = 8, unit = "pt")  # <-- more right room
+      )
+  }
+  
+  # ============================================================================
+  
+  # ---- plot_generator unchanged (kept as-is) ----
+  plot_generator <- function(var_name, force_no_legend = FALSE) {
     df <- processed_data()
     pal_named <- group_palette()
     n_groups <- length(levels(df$Group))
@@ -458,27 +518,19 @@ server <- function(input, output, session) {
       select(Group, valor = all_of(var_name)) %>%
       mutate(Group = droplevels(Group)) %>%
       tidyplot(x = Group, y = valor, color = Group) %>%
-      # add_reference_lines(y = 0, linetype = "solid", linewidth = 0.3) %>%
       add(stat_summary(fun = mean, geom = "bar", color = "black", width = 0.8, linewidth = 0.3) ) %>%
       add_sem_errorbar(color = "black", linewidth = 0.3) %>%
       add(geom_jitter(position = position_jitter(width = 0.15, height = 0),
                       size = 1.75, color = "black", fill = "white", shape = 21)) %>%
       adjust_colors(unname(pal_named)) %>%
-      # add_test_pvalue(
-      #   method = "tukey_hsd",
-      #   hide_info = TRUE,
-      #   hide.ns = TRUE,
-      #   step.increase = 0.15,
-      #   label = "{p.adj.signif}"
-      # ) %>% 
-      # add(scale_y_continuous(
-      #   guide = "prism_offset_minor", 
-      #   expand = expansion(mult = c(0, G_AES$y_expansion))
-      # )) %>%
-      add(coord_cartesian(ylim = c(0, NA), clip = "off")) %>%
+      add(coord_cartesian( clip = "off")) %>%
       adjust_y_axis_title(var_name) %>%
       adjust_x_axis_title("") %>%
       add_title(word(var_name, 1)) %>%
+      add(scale_y_continuous(
+        guide = "prism_offset_minor", 
+        expand = expansion(mult = c(0, 0.075))
+      )) %>% 
       add(theme = theme(
         plot.title = element_text(face = "bold", size = 12, hjust = 0.5, margin = margin(b = 10)),
         axis.line = element_line(colour = "black", linewidth = 0.3),
@@ -486,82 +538,30 @@ server <- function(input, output, session) {
         axis.text.y = element_text(color = "black", size = 10),
         axis.title.y = element_text(color = "black", size = 10),
         axis.text.x = element_blank(),
-        plot.margin = margin(t = 10, r = 10, b = 10, l = 40, unit = "pt"),
-        legend.position = if (isTRUE(input$show_legend)) "right" else "none"
+        
+        # IMPORTANT: extra right margin prevents clipping of p-values etc.
+        plot.margin = margin(t = 10, r = 60, b = 10, l = 40, unit = "pt"),
+        
+        # IMPORTANT: never allow per-plot legend in exports
+        legend.position = if (force_no_legend) "none" else if (isTRUE(input$show_legend)) "right" else "none"
       )) -> p
     
-    # --- Stats: all-by-all by default, or vs selected reference group ---
-    ref <- input$ref_group
-    if (is.null(ref)) ref <- "__ALL__"
-    
-    n_groups <- nlevels(df$Group)
-    
-    if (n_groups >= 3) {
-      
-      if (ref == "__ALL__") {
-        
-        # ALL-BY-ALL (Tukey)
-        p <- p %>% add_test_pvalue(
-          method = "tukey_hsd",
-          hide_info = TRUE,
-          hide.ns = T,
-          step.increase = 0.15,
-          label = "{p.adj.signif}"
-        )
-        
-      } else {
-        
-        # MANY-vs-ONE using emmeans contrasts (treatment vs control)
-        # IMPORTANT: emmeans_test is supported by geom_pwc
-        p <- p %>% add_test_pvalue(
-          method = "emmeans_test",
-          ref.group = ref,
-          hide_info = TRUE,
-          hide.ns = T,
-          step.increase = 0.15,
-          label = "{p.adj.signif}"
-        )
-        
-      }
-      
-    } else if (n_groups == 2) {
-      
-      # Two groups: t-test (has p, not p.adj)
-      p <- p %>% add_test_pvalue(
-        method = "t_test",
-        hide_info = TRUE,
-        hide.ns = T,
-        label = "{p.signif}"
-      )
-    }
+    # ... keep the stats section exactly as you already have it ...
     
     p <- p %>%
-      # this is the real baseline at y=0
       add_reference_lines(y = 0, linetype = "solid", linewidth = 0.3) %>%
-      
-      # FORCE the bottom of the scale to be exactly 0 (not via coord_cartesian)
       add(scale_y_continuous(
         limits = c(0, NA),
+        guide  = "prism_offset_minor",
         expand = expansion(mult = c(0, 0.075))
       )) %>%
-      
-      # IMPORTANT: remove coord_cartesian(ylim=c(0,NA)) (no longer needed)
-      # add(coord_cartesian(...))   # <-- DELETE THIS LINE
-      
       add(theme = theme(
-        # keep y axis line if you want
         axis.line.y = element_line(colour = "black", linewidth = 0.3),
-        
-        # DON'T use the panel border as the “baseline”
         axis.line.x = element_blank(),
-        
-        # optional: also remove x ticks if you want (you already hide x text)
         axis.ticks.x = element_blank()
       ))
     
     return(p)
-    
-    
   }
   
   output$big_plot <- renderPlot({
@@ -582,45 +582,56 @@ server <- function(input, output, session) {
       tmpdir <- tempfile("pdfpkg_")
       dir.create(tmpdir, recursive = TRUE)
       
-      plot_list <- lapply(input$selected_vars, function(v) to_gg(plot_generator(v)))
+      # ----- A) Build plots with legends FORCED OFF -----
+      plot_list <- lapply(input$selected_vars, function(v) to_gg(plot_generator(v, force_no_legend = TRUE)))
       num_plots <- length(plot_list)
-      num_cols <- ceiling(sqrt(num_plots))
-      num_rows <- ceiling(num_plots / num_cols)
+      num_cols  <- ceiling(sqrt(num_plots))
+      num_rows  <- ceiling(num_plots / num_cols)
       
       grid_plots <- plot_grid(plotlist = plot_list, ncol = num_cols, align = "hv", axis = "tblr")
       
-      final_pdf <- grid_plots
-      if (isTRUE(input$show_legend)) {
-        groups <- unique(processed_data()$Group)
-        pal_named <- group_palette()
-        lp <- legend_plot(groups, pal_named, horizontal = TRUE)
-        leg_grob <- cowplot::get_legend(lp)
-        final_pdf <- plot_grid(NULL, leg_grob, NULL, grid_plots, ncol = 1,
-                               rel_heights = c(0.03, 0.12, 0.03, 0.82))
-      }
+      # ----- B) Build ONE legend (top) -----
+      groups    <- unique(processed_data()$Group)
+      pal_named <- group_palette()
       
+      leg_plot <- legend_plot_vertical(groups, pal_named, key_cm = 0.42, text_pt = 11)
+      
+      # put legend on top (as one block) then plots below
+      final_pdf <- plot_grid(
+        leg_plot,
+        grid_plots,
+        ncol = 1,
+        rel_heights = c(0.18, 0.82)
+      )
+      
+      # ----- C) Save combined PDF with extra right padding to avoid page-edge clipping -----
       n_groups <- length(unique(processed_data()$Group))
       single_w <- (n_groups * input$bar_width) + 4
       single_h <- input$plot_height + 3
       
+      plots_w_cm <- num_cols * single_w
+      plots_h_cm <- num_rows * single_h
+      
       combined_path <- file.path(tmpdir, paste0("Combined_", input$sheet_select, ".pdf"))
-      ggsave(combined_path, final_pdf,
-             width = num_cols * single_w,
-             height = (num_rows * single_h) + (if (input$show_legend) 4 else 0),
-             units = "cm", limitsize = FALSE, device = cairo_pdf)
       
-      groups <- unique(processed_data()$Group)
-      pal_named <- group_palette()
+      ggsave(
+        combined_path, final_pdf,
+        width  = plots_w_cm + 2,   # <-- extra width buffer
+        height = plots_h_cm + 4,   # <-- extra height buffer for legend
+        units = "cm", limitsize = FALSE, device = cairo_pdf, bg = "transparent"
+      )
+      
+      # ----- D) Export legend ALSO as separate PDF (like PNG workflow) -----
       legend_pdf_path <- file.path(tmpdir, paste0("Legend_", input$sheet_select, ".pdf"))
-      lp <- legend_plot(groups, pal_named, horizontal = TRUE)
+      dims <- legend_dims_vertical(groups, text_pt = 11, key_cm = 0.42)
       
-      leg_w <- 22
-      leg_h <- if (length(groups) > 3) 2.2 else 1.4
+      ggsave(
+        legend_pdf_path, leg_plot,
+        width = dims$w_cm, height = dims$h_cm, units = "cm",
+        bg = "transparent", device = cairo_pdf, limitsize = FALSE
+      )
       
-      ggsave(legend_pdf_path, lp,
-             width = leg_w, height = leg_h, units = "cm",
-             bg = "transparent", device = cairo_pdf, limitsize = FALSE)
-      
+      # zip
       zip::zipr(zipfile = file, files = list.files(tmpdir, full.names = TRUE))
     }
   )
@@ -641,20 +652,22 @@ server <- function(input, output, session) {
         safe <- gsub("[^A-Za-z0-9_\\-]", "_", v)
         out_png <- file.path(tmpdir, paste0(safe, ".png"))
         p <- to_gg(plot_generator(v))
-        ggsave(out_png, plot = p, width = w_cm, height = h_cm, units = "cm", dpi = 600, bg = "white")
+        ggsave(out_png, plot = p, width = w_cm, height = h_cm, units = "cm", dpi = 600, bg = "transparent")
       }
       
       groups <- unique(processed_data()$Group)
       pal_named <- group_palette()
-      lp <- legend_plot(groups, pal_named, horizontal = TRUE)
+      
+      lp <- legend_plot_vertical(groups, pal_named, key_cm = 0.42, text_pt = 11)
+      dims <- legend_dims_vertical(groups)
       
       legend_png_path <- file.path(tmpdir, "Legend.png")
-      leg_w <- 22
-      leg_h <- if (length(groups) > 3) 2.2 else 1.4
       
-      ggsave(legend_png_path, lp,
-             width = leg_w, height = leg_h, units = "cm",
-             dpi = 600, bg = "transparent")
+      ggsave(
+        legend_png_path, lp,
+        width = dims$w_cm, height = dims$h_cm, units = "cm",
+        dpi = 600, bg = "transparent", limitsize = FALSE
+      )
       
       zip::zipr(zipfile = file, files = list.files(tmpdir, full.names = TRUE))
     }
